@@ -1,6 +1,6 @@
 {
   "name": "attention-router",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Local attention router for parallel coding agents",
   "type": "module",
   "bin": {
@@ -14,7 +14,7 @@
     "cli": "tsx src/cli.ts"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.40.1",
+    "@anthropic-ai/sdk": "^0.91.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^4.3.6"
   },

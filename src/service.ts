@@ -226,7 +226,7 @@ Draft the JSON decision card now.`;
 
   async decide(input: HumanDecision): Promise<{ rule_draft?: JudgmentRule; record: AskRecord }> {
     let recOut: AskRecord | undefined;
-    let ruleOut: JudgmentRule | undefined;
+    // Phase 1: commit the decision itself (fast, holds lock briefly).
     await this.store.commit((s) => {
       const rec = s.asks[input.ask_id];
       if (!rec) throw new DecisionError(`ask not found: ${input.ask_id}`, "not_found");
@@ -239,15 +239,24 @@ Draft the JSON decision card now.`;
       rec.decision = input;
       rec.status = "decided";
       s.attention[rec.ask.project_id] = new Date().toISOString();
-
-      if (input.create_rule) {
-        ruleOut = draftRule({ ask: rec.ask, decision: input });
-        s.rules[ruleOut.id] = ruleOut;
-      }
       recOut = rec;
     });
+
+    // Phase 2: draft the rule (may invoke the LLM — must NOT happen under the file lock).
+    let ruleOut: JudgmentRule | undefined;
+    if (input.create_rule && recOut) {
+      ruleOut = await draftRule({
+        ask: recOut.ask,
+        decision: input,
+        provider: this.cfg.llm_provider,
+      });
+      const rule = ruleOut;
+      await this.store.commit((s) => {
+        s.rules[rule.id] = rule;
+      });
+    }
+
     if (recOut?.ask.callback_url) {
-      // Fire-and-forget delivery; do not block the decide() response.
       void this.deliverCallback(recOut, { rule_draft: ruleOut });
     }
     return { rule_draft: ruleOut, record: recOut! };
@@ -369,6 +378,11 @@ Draft the JSON decision card now.`;
 
   listProjects() {
     return this.store.projects();
+  }
+
+  /** Single-ask lookup — used by GET /asks/:id and the MCP wait_for_decision polling. */
+  getRecord(id: string): AskRecord | undefined {
+    return this.store.getAsk(id);
   }
 
   listPending(): AskRecord[] {

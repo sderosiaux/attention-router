@@ -1,6 +1,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { spawn } from "node:child_process";
 import { Store } from "./storage.ts";
 import { Service, DecisionError } from "./service.ts";
 import { startServer } from "./server.ts";
@@ -88,6 +89,37 @@ async function main(): Promise<void> {
       }
       console.log(JSON.stringify({ results }, null, 2));
       return;
+    }
+    case "watch": {
+      const intervalSec = Number(args[0] ?? process.env.AR_WATCH_INTERVAL_SEC ?? 5);
+      if (!Number.isFinite(intervalSec) || intervalSec < 1) return die("usage: watch [interval_sec]");
+      console.log(`[attn watch] polling every ${intervalSec}s; ctrl-C to quit`);
+      const seen = new Set<string>();
+      // Seed with currently-pending so we don't notify on existing cards at startup
+      try {
+        const svc = await makeService();
+        for (const r of svc.listPending()) seen.add(r.ask.id);
+      } catch (e) {
+        console.error(`[attn watch] could not read state: ${(e as Error).message}`);
+      }
+      while (true) {
+        try {
+          const svc = await makeService();
+          for (const r of svc.listPending()) {
+            if (seen.has(r.ask.id)) continue;
+            seen.add(r.ask.id);
+            await notify({
+              title: `attention-router · ${r.ask.project_name}`,
+              subtitle: r.ask.title.slice(0, 80),
+              body: `ask_id=${r.ask.id} · urgency=${r.urgency ?? "?"} · default=${r.ask.default_option_id}`,
+            });
+            console.log(`[attn watch] notified: ${r.ask.id} — ${r.ask.title.slice(0, 60)}`);
+          }
+        } catch (e) {
+          console.error(`[attn watch] poll error: ${(e as Error).message}`);
+        }
+        await new Promise((res) => setTimeout(res, intervalSec * 1000));
+      }
     }
     case "next": {
       const svc = await makeService();
@@ -231,6 +263,7 @@ Commands:
   submit-jsonl <file>                submit one ask per line (JSONL)
   next                               show top decision card
   batch                              show top 3 cards
+  watch [interval_sec]               poll daemon, fire macOS notification on each new pending card
   decide <ask_id> <A|B|C>            record human decision
   override <ask_id> "<text>"         record override
   skip <ask_id>                      defer (status=skipped)
@@ -252,6 +285,32 @@ Env:
   AR_ESCALATE_HIGH_LOSS (default 100)
   AR_ESCALATE_LOW_CONFIDENCE (default 0.5)
 `);
+}
+
+/**
+ * Native macOS notification via osascript. Silently no-ops on non-darwin
+ * (or falls back to terminal-notifier if the user has it installed).
+ * AppleScript strings escape backslash and double-quote.
+ */
+function escAS(s: string): string {
+  return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+function notify(opts: { title: string; subtitle?: string; body: string }): Promise<void> {
+  if (process.platform !== "darwin") {
+    console.log(`[notify] ${opts.title} :: ${opts.body}`);
+    return Promise.resolve();
+  }
+  const args = [
+    "-e",
+    `display notification "${escAS(opts.body)}" with title "${escAS(opts.title)}"${
+      opts.subtitle ? ` subtitle "${escAS(opts.subtitle)}"` : ""
+    }`,
+  ];
+  return new Promise((res) => {
+    const p = spawn("osascript", args, { stdio: "ignore" });
+    p.on("exit", () => res());
+    p.on("error", () => res());
+  });
 }
 
 function die(msg: string): never {

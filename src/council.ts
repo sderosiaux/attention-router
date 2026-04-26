@@ -1,4 +1,5 @@
 import process from "node:process";
+import { z } from "zod";
 import type {
   AgentAsk,
   CouncilResult,
@@ -7,6 +8,13 @@ import type {
   OptionId,
 } from "./types.ts";
 import { defaultProvider, type LlmProvider } from "./llm.ts";
+
+const VoteSchema = z.object({
+  vote: z.enum(["A", "B", "C"]),
+  confidence: z.number().min(0).max(1),
+  reason: z.string().min(1).max(500),
+});
+type Vote = z.infer<typeof VoteSchema>;
 
 export interface PersonaSpec {
   name: string;
@@ -108,18 +116,20 @@ ${askPayload}
 Vote now. Reply with the JSON object only.`;
 
   try {
-    const r = await provider.call({
+    const r = await provider.call<Vote>({
       system: SHARED_SYSTEM_PREFIX,
       systemCacheable: true,
       user: userPrompt,
       maxTokens: 256,
+      schema: VoteSchema,
     });
-    const parsed = parseVote(r.text);
+    // Prefer the schema-validated parse if the provider returned one (Anthropic + Mock both do).
+    const v = r.parsed ?? parseVoteText(r.text);
     return {
       persona: persona.name,
-      vote: parsed.vote,
-      confidence: round2(clamp01(parsed.confidence)),
-      reason: parsed.reason.slice(0, 200),
+      vote: v.vote,
+      confidence: round2(clamp01(v.confidence)),
+      reason: v.reason.slice(0, 200),
     };
   } catch (e) {
     // Fallback: agent default with low confidence and the failure reason.
@@ -170,9 +180,9 @@ ${ruleLines}
 --- end ---`;
 }
 
-function parseVote(raw: string): { vote: OptionId; confidence: number; reason: string } {
+/** Last-resort plain-text JSON parse. Used only if a provider returned text without a parsed field. */
+function parseVoteText(raw: string): Vote {
   const trimmed = raw.trim().replace(/^```(?:json)?/, "").replace(/```$/, "").trim();
-  // Try direct parse first; fall back to extracting first {...} block.
   let obj: unknown;
   try {
     obj = JSON.parse(trimmed);
@@ -181,17 +191,7 @@ function parseVote(raw: string): { vote: OptionId; confidence: number; reason: s
     if (!m) throw new Error("no JSON in council response");
     obj = JSON.parse(m[0]);
   }
-  if (!isObj(obj)) throw new Error("council response is not an object");
-  const vote = obj.vote;
-  if (vote !== "A" && vote !== "B" && vote !== "C") {
-    throw new Error(`bad vote value: ${String(vote)}`);
-  }
-  const confidence =
-    typeof obj.confidence === "number" && Number.isFinite(obj.confidence)
-      ? obj.confidence
-      : 0.5;
-  const reason = typeof obj.reason === "string" ? obj.reason : "(no reason)";
-  return { vote, confidence, reason };
+  return VoteSchema.parse(obj);
 }
 
 export function entropy(votes: OptionId[]): number {
@@ -260,10 +260,6 @@ function describeDisagreement(votes: CouncilVote[], ask: AgentAsk): string {
   if (set.size <= 1) return "unanimous";
   const sample = votes.slice(0, 3).map((v) => `${v.persona}→${v.vote}`).join(", ");
   return `surface=${ask.verification_surface}; split: ${sample}`;
-}
-
-function isObj(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
 function clamp01(n: number): number {

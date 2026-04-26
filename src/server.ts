@@ -47,6 +47,19 @@ async function handle(
   const url = new URL(req.url ?? "/", "http://localhost");
   const route = `${req.method} ${url.pathname}`;
 
+  // Pattern routes (params): GET /asks/<id>
+  const askByIdMatch = url.pathname.match(/^\/asks\/([A-Za-z0-9._:-]{1,128})$/);
+  if (req.method === "GET" && askByIdMatch && url.pathname !== "/asks") {
+    try {
+      const rec = svc.getRecord(askByIdMatch[1]!);
+      if (!rec) return send(res, 404, { error: "ask not found" });
+      return send(res, 200, { record: rec });
+    } catch (e) {
+      if (e instanceof SchemaError) return send(res, 400, { error: e.message });
+      throw e;
+    }
+  }
+
   try {
     switch (route) {
       case "GET /healthz":

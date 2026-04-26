@@ -55,15 +55,16 @@ const ask: AgentAsk = {
 class FixedVoteProvider implements LlmProvider {
   constructor(private votes: { vote: OptionId; confidence: number; reason: string }[]) {}
   private call_idx = 0;
-  async call(_opts: LlmCallOptions): Promise<LlmCallResult> {
+  async call<T>(opts: LlmCallOptions<T>): Promise<LlmCallResult<T>> {
     const v = this.votes[this.call_idx % this.votes.length]!;
     this.call_idx++;
-    return { text: JSON.stringify(v) };
+    const value = v as unknown as T;
+    return { text: JSON.stringify(v), parsed: opts.schema ? value : undefined };
   }
 }
 
 class FailingProvider implements LlmProvider {
-  async call(_opts: LlmCallOptions): Promise<LlmCallResult> {
+  async call<T>(_opts: LlmCallOptions<T>): Promise<LlmCallResult<T>> {
     throw new Error("simulated LLM outage");
   }
 }

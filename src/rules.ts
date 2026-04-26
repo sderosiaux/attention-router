@@ -1,3 +1,5 @@
+import { z } from "zod";
+import { randomUUID } from "node:crypto";
 import type {
   AgentAsk,
   AskOption,
@@ -5,30 +7,46 @@ import type {
   JudgmentRule,
   OptionId,
 } from "./types.ts";
-import { randomUUID } from "node:crypto";
+import type { LlmProvider } from "./llm.ts";
+
+const ExtractionSchema = z.object({
+  prefer: z.string().min(1).max(80),
+  avoid: z.string().min(0).max(60),
+});
+type Extraction = z.infer<typeof ExtractionSchema>;
 
 export interface DraftRuleInput {
   ask: AgentAsk;
   decision: HumanDecision;
   scope?: "project" | "all";
+  /** Optional LLM provider — if absent, uses cheap fallback (chosen.label as prefer). */
+  provider?: LlmProvider;
 }
 
-export function draftRule(input: DraftRuleInput): JudgmentRule {
+/**
+ * Draft a JudgmentRule from a HumanDecision.
+ *
+ * `prefer` and `avoid` are extracted by the LLM in one call (3-5 word phrases
+ * grounded in the ask). This replaces the brittle frequency-weighted keyword
+ * extraction the v0.1.1 used.
+ *
+ * If no provider is supplied (e.g. unit tests against pure logic), falls back
+ * to using the chosen option's label verbatim — better than nothing, never wrong.
+ */
+export async function draftRule(input: DraftRuleInput): Promise<JudgmentRule> {
   const { ask, decision } = input;
   const scope = input.scope ?? "project";
 
   const chosen = pickChosenOption(ask, decision);
   const rejected = ask.options.filter((o) => o !== chosen);
 
-  const prefer = chosen
-    ? topKeyword(chosen.label + " " + chosen.evidence.join(" "), chosen.label)
-    : (decision.override_text ?? "human override");
-  const avoid = rejected.length
-    ? topKeyword(
-        rejected.map((o) => o.label + " " + o.evidence.join(" ")).join(" "),
-        rejected[0]!.label,
-      )
-    : "";
+  const { prefer, avoid } = await extractPreferAvoid({
+    ask,
+    chosen,
+    rejected,
+    decision,
+    provider: input.provider,
+  });
 
   return {
     id: `rule_${randomUUID().slice(0, 8)}`,
@@ -37,7 +55,9 @@ export function draftRule(input: DraftRuleInput): JudgmentRule {
     when: `verification_surface=${ask.verification_surface}; reversibility=${ask.reversibility}`,
     prefer,
     avoid,
-    examples: chosen ? [`${ask.title} → ${chosen.label}`] : [`${ask.title} → ${decision.override_text ?? "override"}`],
+    examples: chosen
+      ? [`${ask.title} → ${chosen.label}`]
+      : [`${ask.title} → ${decision.override_text ?? "override"}`],
     counterexamples: rejected.map((o) => `${ask.title} ↛ ${o.label}`),
     priority: 1,
     source_ask_id: ask.id,
@@ -47,20 +67,128 @@ export function draftRule(input: DraftRuleInput): JudgmentRule {
   };
 }
 
+interface ExtractInput {
+  ask: AgentAsk;
+  chosen: AskOption | undefined;
+  rejected: AskOption[];
+  decision: HumanDecision;
+  provider?: LlmProvider;
+}
+
+async function extractPreferAvoid(
+  input: ExtractInput,
+): Promise<{ prefer: string; avoid: string }> {
+  const { ask, chosen, rejected, decision, provider } = input;
+
+  // Override path: the human's free-form text IS the prefer signal — no LLM call needed.
+  if (decision.choice === "override") {
+    return {
+      prefer: (decision.override_text ?? "override").slice(0, 80),
+      avoid: rejected[0]?.label.slice(0, 60) ?? "",
+    };
+  }
+
+  // No provider → cheap fallback: chosen label verbatim. Used by unit tests of pure logic.
+  if (!provider) {
+    return {
+      prefer: (chosen?.label ?? "").slice(0, 80),
+      avoid: rejected[0]?.label.slice(0, 60) ?? "",
+    };
+  }
+
+  const system = `You distill a developer's decision into two short keyword phrases for a JudgmentRule.
+
+Output STRICT JSON only, no prose, no markdown:
+{"prefer": "<3-5 words capturing why the chosen option won>", "avoid": "<3-5 words capturing what the rejected options had in common to avoid>"}
+
+Rules:
+- prefer/avoid each ≤ 60 chars
+- Use noun phrases, not full sentences
+- Ground in the actual labels/evidence — do NOT invent generic concepts
+- "avoid" should describe a pattern the human walked away from, not just one option's label
+- Never include the words "user", "value", "thing", "way", "case", "time" — they carry no decision signal`;
+
+  const user = renderExtractionPrompt(ask, chosen!, rejected);
+
+  try {
+    const r = await provider.call<Extraction>({
+      system,
+      systemCacheable: true,
+      user,
+      maxTokens: 150,
+      schema: ExtractionSchema,
+    });
+    const ex = r.parsed ?? parseExtractionText(r.text);
+    return {
+      prefer: clip(ex.prefer, chosen?.label ?? ""),
+      avoid: clip(ex.avoid, rejected[0]?.label ?? ""),
+    };
+  } catch {
+    // LLM error → fall back to cheap verbatim labels. Don't crash the whole decide flow.
+    return {
+      prefer: (chosen?.label ?? "").slice(0, 80),
+      avoid: rejected[0]?.label.slice(0, 60) ?? "",
+    };
+  }
+}
+
+function renderExtractionPrompt(
+  ask: AgentAsk,
+  chosen: AskOption,
+  rejected: AskOption[],
+): string {
+  const rejectedBlock = rejected
+    .map(
+      (o) =>
+        `Option ${o.id}: ${o.label}\n  Evidence: ${o.evidence.join(" | ")}`,
+    )
+    .join("\n");
+
+  return `Decision title: ${ask.title}
+
+Chosen option ${chosen.id}: ${chosen.label}
+  Evidence: ${chosen.evidence.join(" | ")}
+
+Rejected:
+${rejectedBlock}
+
+Distill prefer/avoid now.`;
+}
+
+function pickChosenOption(ask: AgentAsk, decision: HumanDecision): AskOption | undefined {
+  if (decision.choice === "override") return undefined;
+  return ask.options.find((o) => o.id === (decision.choice as OptionId));
+}
+
+/** Last-resort plain-text JSON parse — only used when a provider returned text without parsed. */
+function parseExtractionText(raw: string): Extraction {
+  const trimmed = raw.trim().replace(/^```(?:json)?/, "").replace(/```$/, "").trim();
+  let obj: unknown;
+  try {
+    obj = JSON.parse(trimmed);
+  } catch {
+    const m = trimmed.match(/\{[\s\S]*\}/);
+    if (!m) throw new Error("no JSON in extractor response");
+    obj = JSON.parse(m[0]);
+  }
+  return ExtractionSchema.parse(obj);
+}
+
+function clip(s: string, fallback: string): string {
+  const v = (s || fallback).trim();
+  return v.slice(0, 80);
+}
+
 /**
- * Cheap heuristic topic extraction from the ask's title + context.
- * Used by Service.submitAsk to filter accepted rules before injecting them into
- * the council prompt — prevents cross-domain rule bleed (audit_rule_self_loop A).
- *
- * Note: for higher precision, swap with an LLM call (claude-haiku-4-5 with the same
- * SHARED_SYSTEM_PREFIX). For now keep it deterministic and cheap.
+ * Lightweight topic extraction — kept heuristic on purpose: this runs on every
+ * ask and stays cheap. Returns up to 6 keywords for rule-relevance filtering.
  */
 export function extractTopic(ask: { title: string; context: string }): string[] {
   const text = `${ask.title} ${ask.context}`.toLowerCase();
   const words = text
     .replace(/[^a-z0-9_\- ]+/g, " ")
     .split(/\s+/)
-    .filter((w) => w.length >= 4 && !STOPWORDS.has(w) && !/^\d+$/.test(w));
+    .filter((w) => w.length >= 4 && !TOPIC_STOPWORDS.has(w) && !/^\d+$/.test(w));
   const counts = new Map<string, number>();
   for (const w of words) counts.set(w, (counts.get(w) ?? 0) + 1);
   return Array.from(counts.entries())
@@ -71,71 +199,17 @@ export function extractTopic(ask: { title: string; context: string }): string[] 
 
 /** Returns true if rule.topic shares ≥1 word with the new ask's topic. */
 export function ruleMatchesAsk(rule: { topic?: string[] }, askTopic: string[]): boolean {
-  if (!rule.topic || rule.topic.length === 0) return true; // legacy rules: always match
+  if (!rule.topic || rule.topic.length === 0) return true;
   if (askTopic.length === 0) return true;
   const set = new Set(askTopic);
   return rule.topic.some((t) => set.has(t));
 }
 
-function pickChosenOption(ask: AgentAsk, decision: HumanDecision): AskOption | undefined {
-  if (decision.choice === "override") return undefined;
-  return ask.options.find((o) => o.id === (decision.choice as OptionId));
-}
-
-const STOPWORDS = new Set([
-  "the", "a", "an", "to", "of", "in", "on", "for", "and", "or", "with", "by",
-  "is", "it", "this", "that", "use", "using", "via", "as", "at", "be", "are",
-  "was", "were", "from", "into", "out", "up", "down", "all", "any", "each",
-  "more", "less", "than", "if", "but", "not", "no", "so", "do", "does", "did",
-  "have", "has", "had", "can", "could", "should", "would", "will", "may",
-  "might", "must", "ship", "add", "make", "set", "get", "etc",
-  // generic option-flow words that shouldn't dominate prefer/avoid
-  "default", "always", "option", "choice", "label", "rules", "rule",
-  "evidence", "next", "step", "cost", "wrong", "confidence",
-  "long", "short", "small", "big", "high", "low", "ago", "now", "later",
+// Topic extraction needs a smaller filter — it's just for relevance routing,
+// not for naming a rule. Function words only.
+const TOPIC_STOPWORDS = new Set([
+  "the", "and", "for", "with", "this", "that", "have", "from", "they", "your",
+  "what", "when", "where", "should", "could", "would", "must", "will", "into",
+  "than", "more", "than", "some", "such", "very", "just", "then", "also",
+  "been", "were", "their", "them", "those", "these",
 ]);
-
-const CONTEXT_WEIGHT_BOOST = new Set([
-  // domain-specific words we know carry decision intent
-  "redis", "postgres", "sqlite", "lru", "cache", "queue", "webhook",
-  "callback", "bearer", "token", "auth", "session", "cooldown", "interface",
-  "pluggable", "heuristic", "llm", "decay", "manual", "stale",
-]);
-
-/**
- * Pick the most decision-carrying word.
- * Strategy:
- *   1. tokenize, drop stopwords / pure numbers / short words
- *   2. boost domain-specific terms
- *   3. score by frequency × idf-ish length bonus, ties → first occurrence
- */
-function topKeyword(text: string, fallback?: string): string {
-  const words = text
-    .toLowerCase()
-    .replace(/[^a-z0-9_\- ]+/g, " ")
-    .split(/\s+/)
-    .filter((w) => w.length >= 4 && !STOPWORDS.has(w) && !/^\d+$/.test(w));
-  if (words.length === 0) {
-    return (fallback ?? text).slice(0, 60);
-  }
-
-  const score = new Map<string, number>();
-  const firstSeen = new Map<string, number>();
-  words.forEach((w, i) => {
-    const boost = CONTEXT_WEIGHT_BOOST.has(w) ? 5 : 1;
-    const lengthBonus = Math.min(2, w.length / 8);
-    const cur = score.get(w) ?? 0;
-    score.set(w, cur + boost + lengthBonus);
-    if (!firstSeen.has(w)) firstSeen.set(w, i);
-  });
-
-  let best = words[0]!;
-  let bestScore = -Infinity;
-  for (const [w, s] of score) {
-    if (s > bestScore || (s === bestScore && firstSeen.get(w)! < firstSeen.get(best)!)) {
-      best = w;
-      bestScore = s;
-    }
-  }
-  return best;
-}

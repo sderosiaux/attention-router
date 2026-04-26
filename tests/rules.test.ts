@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { draftRule } from "../src/rules.ts";
+import { draftRule, extractTopic, ruleMatchesAsk } from "../src/rules.ts";
+import type { LlmCallOptions, LlmCallResult, LlmProvider } from "../src/llm.ts";
 import type { AgentAsk, HumanDecision } from "../src/types.ts";
 
 const ask: AgentAsk = {
@@ -10,7 +11,7 @@ const ask: AgentAsk = {
   project_type: "software",
   verification_surface: "business_rule",
   title: "Pick caching layer",
-  context: "",
+  context: "redis lookup latency vs in-memory map for hot session reads",
   options: [
     {
       id: "A",
@@ -28,6 +29,14 @@ const ask: AgentAsk = {
       cost_if_wrong: "lost cache on restart",
       confidence: 0.6,
     },
+    {
+      id: "C",
+      label: "Skip caching",
+      evidence: ["maybe overkill"],
+      predicted_next_step: "no-op",
+      cost_if_wrong: "slow profile reads",
+      confidence: 0.4,
+    },
   ],
   default_option_id: "A",
   confidence: 0.65,
@@ -38,25 +47,46 @@ const ask: AgentAsk = {
   created_at: new Date().toISOString(),
 };
 
+class FixedExtractorProvider implements LlmProvider {
+  constructor(private prefer: string, private avoid: string) {}
+  async call<T>(opts: LlmCallOptions<T>): Promise<LlmCallResult<T>> {
+    const value = { prefer: this.prefer, avoid: this.avoid } as unknown as T;
+    return { text: JSON.stringify(value), parsed: opts.schema ? value : undefined };
+  }
+}
+
+class FailingProvider implements LlmProvider {
+  async call<T>(_opts: LlmCallOptions<T>): Promise<LlmCallResult<T>> {
+    throw new Error("simulated extractor outage");
+  }
+}
+
 describe("draftRule", () => {
-  it("creates a draft rule with prefer/avoid keywords", () => {
+  it("uses LLM to extract prefer/avoid", async () => {
+    const provider = new FixedExtractorProvider("redis cache", "in-memory storage");
     const decision: HumanDecision = {
-      ask_id: ask.id,
-      choice: "A",
-      create_rule: true,
-      created_at: new Date().toISOString(),
+      ask_id: ask.id, choice: "A", create_rule: true, created_at: new Date().toISOString(),
     };
-    const r = draftRule({ ask, decision });
+    const r = await draftRule({ ask, decision, provider });
     assert.equal(r.status, "draft");
     assert.equal(r.scope, "project");
     assert.equal(r.project_id, "p1");
     assert.equal(r.source_ask_id, ask.id);
-    assert.match(r.prefer, /redis/);
+    assert.equal(r.prefer, "redis cache");
+    assert.equal(r.avoid, "in-memory storage");
     assert.ok(r.examples.length >= 1);
     assert.ok(r.counterexamples.length >= 1);
+    assert.ok(r.topic && r.topic.length > 0, "topic should be extracted");
   });
 
-  it("supports override choice", () => {
+  it("override path bypasses the LLM and uses the human's text", async () => {
+    let called = false;
+    const provider: LlmProvider = {
+      async call<T>(_opts: LlmCallOptions<T>): Promise<LlmCallResult<T>> {
+        called = true;
+        return { text: "{}" };
+      },
+    };
     const decision: HumanDecision = {
       ask_id: ask.id,
       choice: "override",
@@ -64,19 +94,54 @@ describe("draftRule", () => {
       create_rule: true,
       created_at: new Date().toISOString(),
     };
-    const r = draftRule({ ask, decision });
+    const r = await draftRule({ ask, decision, provider });
+    assert.equal(called, false, "LLM should not be called on override");
     assert.equal(r.prefer, "use cloudflare workers cache");
   });
 
-  it("scope=all sets project_id undefined", () => {
+  it("falls back to chosen.label when LLM throws", async () => {
     const decision: HumanDecision = {
-      ask_id: ask.id,
-      choice: "B",
-      create_rule: true,
-      created_at: new Date().toISOString(),
+      ask_id: ask.id, choice: "A", create_rule: true, created_at: new Date().toISOString(),
     };
-    const r = draftRule({ ask, decision, scope: "all" });
+    const r = await draftRule({ ask, decision, provider: new FailingProvider() });
+    assert.equal(r.prefer, "Redis cache for profile"); // chosen label verbatim
+  });
+
+  it("no provider → cheap label fallback (used by unit tests of pure logic)", async () => {
+    const decision: HumanDecision = {
+      ask_id: ask.id, choice: "B", create_rule: true, created_at: new Date().toISOString(),
+    };
+    const r = await draftRule({ ask, decision }); // no provider
+    assert.equal(r.prefer, "In-memory LRU");
+  });
+
+  it("scope=all sets project_id undefined", async () => {
+    const decision: HumanDecision = {
+      ask_id: ask.id, choice: "B", create_rule: true, created_at: new Date().toISOString(),
+    };
+    const r = await draftRule({ ask, decision, scope: "all" });
     assert.equal(r.scope, "all");
     assert.equal(r.project_id, undefined);
+  });
+});
+
+describe("extractTopic / ruleMatchesAsk", () => {
+  it("extracts up to 6 topic keywords from title+context", () => {
+    const t = extractTopic({
+      title: "Pick caching layer for hot session reads",
+      context: "redis lookup latency vs memory map; users read profiles often",
+    });
+    assert.ok(t.length > 0 && t.length <= 6);
+    assert.ok(t.includes("redis") || t.includes("caching"));
+  });
+
+  it("matches when rule.topic intersects ask topic", () => {
+    const askTopic = ["redis", "caching", "session"];
+    assert.equal(ruleMatchesAsk({ topic: ["redis", "store"] }, askTopic), true);
+    assert.equal(ruleMatchesAsk({ topic: ["bearer", "auth"] }, askTopic), false);
+  });
+
+  it("legacy rules (no topic) always match (backward compat)", () => {
+    assert.equal(ruleMatchesAsk({}, ["anything"]), true);
   });
 });

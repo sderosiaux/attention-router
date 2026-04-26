@@ -197,23 +197,24 @@ server.tool(
     const deadlineMs = Date.now() + (max_wait_sec ?? 300) * 1000;
 
     while (Date.now() < deadlineMs) {
-      let batch: { ask: { id: string }; status: string; decision?: { choice: string; override_text?: string } }[];
+      let rec: {
+        ask: { id: string; default_option_id?: string };
+        status: string;
+        decision?: { choice: string; override_text?: string };
+        safe_default_option_id?: string;
+      } | undefined;
       try {
-        const r = await routerFetch(`/next?max=99`);
+        const r = await routerFetch(`/asks/${encodeURIComponent(ask_id)}`);
+        if (r.status === 404) {
+          return errorContent(`ask_id=${ask_id} not found in router state`);
+        }
         const out = (await r.json()) as any;
-        batch = out.batch ?? [];
+        rec = out.record;
       } catch (e) {
         return errorContent(`router unreachable: ${(e as Error).message}`);
       }
-
-      const rec = batch.find((b) => b.ask.id === ask_id);
-
       if (!rec) {
-        // Not in pending batch — might be auto_resolved/decided already. Inspect directly.
-        // Easiest: check status counters; for now report not found and return.
-        return textContent(
-          `ask_id=${ask_id} not in current pending batch. It may have been auto_resolved before this wait started, or already decided. Check the daemon's state directly via the CLI: \`ar status\`.`,
-        );
+        return errorContent(`ask_id=${ask_id} returned empty record`);
       }
 
       if (rec.decision) {
@@ -223,7 +224,11 @@ server.tool(
           `decided: ${value}\n\nask_id=${ask_id}\nApply this choice and proceed.`,
         );
       }
-
+      if (rec.status === "auto_resolved") {
+        return textContent(
+          `auto_resolved: proceed with option ${rec.safe_default_option_id}\n\nask_id=${ask_id}\nThe council was confident enough that the human was not paged.`,
+        );
+      }
       if (rec.status === "expired") {
         return textContent(
           `expired: ask_id=${ask_id} aged out before the human responded. Either proceed with the agent default or re-submit with a tighter expires_in_seconds.`,
@@ -234,7 +239,12 @@ server.tool(
           `skipped: the human deferred this ask. It will re-surface after AR_SKIP_COOLDOWN_SEC (default 1800s) if score still warrants. Decide whether to wait or use the default.`,
         );
       }
-
+      if (rec.status === "rejected") {
+        return errorContent(
+          `rejected: ask_id=${ask_id} was rejected (likely a naked-question retry case). Check repair_instructions on the record.`,
+        );
+      }
+      // status === pending | stale → keep polling
       await new Promise((r) => setTimeout(r, intervalMs));
     }
 
