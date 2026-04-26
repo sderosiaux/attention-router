@@ -75,7 +75,12 @@ actor Daemon {
   }
 
   private func req(_ method: String, _ path: String, body: Data? = nil) -> URLRequest {
-    var r = URLRequest(url: baseURL.appendingPathComponent(path))
+    // Don't use appendingPathComponent — it URL-encodes '?' and breaks
+    // query strings (e.g. /next?max=3 becomes /next%3Fmax=3 → 404).
+    let base = baseURL.absoluteString.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    let p = path.hasPrefix("/") ? path : "/\(path)"
+    let url = URL(string: "\(base)\(p)")!
+    var r = URLRequest(url: url)
     r.httpMethod = method
     r.setValue("application/json", forHTTPHeaderField: "content-type")
     if let t = token { r.setValue("Bearer \(t)", forHTTPHeaderField: "authorization") }
