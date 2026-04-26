@@ -50,17 +50,19 @@ The router's LLM drafts 3 distinct options from your dilemma + context — you d
 
 ## 4. Handle the response
 
+`ask_human` **blocks by default** — it polls the daemon internally and only returns when the human has decided (or auto-resolution / expiry / skip / timeout). You don't need a separate `wait_for_decision` call.
+
 Three possible outcomes:
 
 - **`auto_resolved`** — the council was unanimous and the impact is low. The tool returns `safe_default_option_id` (A, B, or C). **Proceed silently** with that option. The human was not notified. Do not announce "I asked the router" — just continue the task.
 
-- **`queued`** — the human will see this card. The tool returns an `ask_id` and the drafted options. Do **one** of:
-  1. Call `wait_for_decision({ask_id: "..."})` to block until the human answers (default 5min timeout, can re-call to wait longer).
-  2. Pick up something independent and check back later via `wait_for_decision` or `get_pending`.
+- **`decided` / `expired` / `skipped`** — the human responded (or didn't in time). The tool returns the choice (A|B|C or override text), or tells you the ask aged out / was deferred. Apply the choice and continue. If `expired`, fall back to the agent's original `default_option_id`.
 
-  When the decision lands, it's either `A`/`B`/`C` (apply that option's `predicted_next_step`) or an override text (apply the human's instruction verbatim).
+- **`timeout`** — 4 hours elapsed without a human decision. The tool returns the `ask_id` so you can call `wait_for_decision({ask_id})` to keep waiting, or proceed with the agent default if the work is unblocked.
 
 - **error / rejected** — the router rejected the ask as too vague. The tool tells you what's missing (longer dilemma, more concrete context). Fix and retry **once**. If still rejected, fall back to direct conversation with the user.
+
+For explicit fire-and-forget (rare), pass `wait: false`. You'll then need to call `wait_for_decision({ask_id})` later.
 
 ## 5. Anti-patterns to avoid
 

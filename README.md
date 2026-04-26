@@ -99,6 +99,11 @@ That's it. The plugin ships:
 
 - Node ≥ 20 in `PATH`
 - An Anthropic API key as `THE_ANTHROPIC_API_KEY` (Claude Code overrides `ANTHROPIC_API_KEY=dummy`, so the daemon's hook reads `THE_ANTHROPIC_API_KEY` first). Without a key, the council falls back to `MockProvider` (deterministic but useless beyond smoke tests).
+- **`MCP_TIMEOUT=14400000`** in your Claude Code `~/.claude/settings.json` `env` block (4 hours, in milliseconds). Without this, Claude Code kills any MCP tool call after 30s — and `ask_human` is **blocking by default** (it waits for your decision). Set it once:
+  ```json
+  { "env": { "MCP_TIMEOUT": "14400000" } }
+  ```
+  Restart Claude Code after editing.
 
 ### Your daily flow
 
@@ -224,6 +229,7 @@ All env vars; sane defaults; configure only what you need.
 | Var | Default | Effect |
 |---|---|---|
 | `THE_ANTHROPIC_API_KEY` | — | Real Anthropic key for the council. Preferred over `ANTHROPIC_API_KEY` (which Claude Code overrides). |
+| `MCP_TIMEOUT` (CC env) | `30000` (30s) | **Set this in `~/.claude/settings.json` env to `14400000`** (4h) — `ask_human` blocks until you decide; default Claude Code timeout will kill it. |
 | `ANTHROPIC_API_KEY` | `dummy` (in CC) | Fallback. If neither set, council uses `MockProvider`. |
 | `AR_LLM_MODEL` | `claude-haiku-4-5` | Model for the 5 council personas. |
 | `AR_LLM_MODE` | (auto) | Force `mock` to disable real LLM calls (used by the test suite). |

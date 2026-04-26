@@ -54,6 +54,11 @@ The plugin ships:
 - Node ≥ 20 in `PATH`.
 - A Claude API key as `THE_ANTHROPIC_API_KEY` (Claude Code stomps on `ANTHROPIC_API_KEY=dummy` so the daemon's hook reads `THE_ANTHROPIC_API_KEY` first). Without a key, the council falls back to MockProvider.
 - First run installs `tsx` lazily via `npx -y tsx` — give it a few seconds on session 1.
+- **`MCP_TIMEOUT` env in Claude Code's `~/.claude/settings.json`** — `ask_human` is blocking by default (it waits for your decision via internal polling), so the default 30s Claude Code MCP timeout will kill it. Add:
+  ```json
+  { "env": { "MCP_TIMEOUT": "14400000" } }
+  ```
+  (4 hours, in ms; max practical = 86400000 = 24h). Restart Claude Code after the edit. Without this, `ask_human` calls will fail after 30s with a tool timeout.
 
 ## How the human sees pending cards
 
