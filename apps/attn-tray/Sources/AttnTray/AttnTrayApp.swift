@@ -85,12 +85,20 @@ actor Daemon {
 
   func nextBatch() async throws -> [Record] {
     let r = req("GET", "/next?max=3")
+    NSLog("[attn-tray] GET %@", r.url?.absoluteString ?? "(nil url)")
     let (data, resp) = try await URLSession.shared.data(for: r)
-    guard let h = resp as? HTTPURLResponse, h.statusCode == 200 else {
-      throw DaemonError.http((resp as? HTTPURLResponse)?.statusCode ?? -1, String(data: data, encoding: .utf8) ?? "")
+    guard let h = resp as? HTTPURLResponse else {
+      throw DaemonError.http(-1, "no HTTP response")
+    }
+    NSLog("[attn-tray] response status=%d bytes=%d", h.statusCode, data.count)
+    guard h.statusCode == 200 else {
+      throw DaemonError.http(h.statusCode, String(data: data, encoding: .utf8) ?? "")
     }
     return try JSONDecoder().decode(NextResponse.self, from: data).batch
   }
+
+  /// Exposed for the popover error view.
+  func currentURL() -> String { baseURL.absoluteString }
 
   func decide(askId: String, choice: String, override: String? = nil) async throws {
     var body: [String: Any] = ["ask_id": askId, "choice": choice, "create_rule": true]
@@ -145,12 +153,19 @@ final class Poller: ObservableObject {
         }
         firstPoll = false
       } catch {
-        lastError = "daemon unreachable"
+        // Surface the actual error to the popover instead of a generic line —
+        // makes 'daemon unreachable' actionable (DNS? port? auth? ATS?).
+        let detail = "\(error)"
+        lastError = "ERROR: \(detail.prefix(200))"
         statusText = "error"
+        NSLog("[attn-tray] poll error: %@", detail)
       }
       try? await Task.sleep(nanoseconds: UInt64(intervalSec * 1_000_000_000))
     }
   }
+
+  /// Exposed for the popover error view.
+  func daemonURL() async -> String { await daemon.currentURL() }
 
   func decide(_ choice: String) async {
     guard let rec = batch.first else { return }
@@ -194,17 +209,31 @@ struct CardContent: View {
     }
   }
 
+  @State private var diagURL: String = "?"
+
   private var emptyView: some View {
     VStack(spacing: 10) {
       Image(systemName: "tray").font(.system(size: 40)).foregroundStyle(.secondary)
       Text("Inbox zero").font(.headline)
       Text(poller.statusText).font(.caption).foregroundStyle(.tertiary)
+      Text("daemon: \(diagURL)")
+        .font(.system(.caption2, design: .monospaced))
+        .foregroundStyle(.tertiary)
+        .textSelection(.enabled)
       if let err = poller.lastError {
-        Text(err).font(.caption).foregroundStyle(.red)
+        ScrollView {
+          Text(err)
+            .font(.system(.caption, design: .monospaced))
+            .foregroundStyle(.red)
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxHeight: 80)
       }
     }
-    .frame(width: 380, height: 200)
+    .frame(width: 420, height: 240)
     .padding(20)
+    .task { diagURL = await poller.daemonURL() }
   }
 
   private func cardView(_ rec: Record) -> some View {
@@ -326,11 +355,13 @@ final class FloatingWindowController {
   }
 
   func show() {
+    print("[attn-tray] FloatingWindowController.show() called")
     if window == nil { build() }
-    guard let w = window else { return }
+    guard let w = window else { print("[attn-tray] WARN: window is nil after build"); return }
     centerOnActiveScreen(w)
     NSApp.activate(ignoringOtherApps: true)
     w.makeKeyAndOrderFront(nil)
+    print("[attn-tray] window ordered front, frame=\(w.frame), level=\(w.level.rawValue)")
   }
 
   func hide() {
@@ -387,7 +418,9 @@ final class MenubarController {
     )
 
     if let button = statusItem.button {
-      button.image = NSImage(systemSymbolName: "tray.fill", accessibilityDescription: "attention-router")
+      // bell.badge.fill is visually distinctive (bell with red dot) and clearly
+      // signals "you have an alert" — unlike tray.fill which looks like Stocks.
+      button.image = NSImage(systemSymbolName: "bell.badge.fill", accessibilityDescription: "attention-router")
       button.imagePosition = .imageLeft
       button.target = self
       button.action = #selector(togglePopover(_:))
@@ -435,9 +468,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
   func applicationDidFinishLaunching(_ notification: Notification) {
     NSApp.setActivationPolicy(.accessory) // no Dock icon
+    print("[attn-tray] launched, pid=\(ProcessInfo.processInfo.processIdentifier)")
     poller = Poller()
     floating = FloatingWindowController(poller: poller)
     menubar = MenubarController(poller: poller, floating: floating)
+    if let btn = menubar.statusItem.button {
+      print("[attn-tray] status item button created; image=\(String(describing: btn.image))")
+    } else {
+      print("[attn-tray] WARN: statusItem.button is nil — icon will not appear")
+    }
   }
 }
 
