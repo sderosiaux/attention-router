@@ -1,0 +1,5 @@
+{
+  "enabledPlugins": {
+    "attention-router@sderosiaux-claude-plugins": true
+  }
+}

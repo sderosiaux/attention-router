@@ -9,7 +9,7 @@ export function formatCard(rec: AskRecord, now: Date = new Date()): string {
     ),
   );
 
-  const head = `${ask.project_name} · ~${ask.requested_human_seconds}s requested · expires in ${formatSec(remaining)}`;
+  const head = `[${ask.id}]  ${ask.project_name} · ~${ask.requested_human_seconds}s requested · expires in ${formatSec(remaining)}`;
   const lines: string[] = [head, "", ask.title.toUpperCase(), "", "Context:"];
   for (const l of clip(ask.context, 5)) lines.push(`  ${l}`);
 
@@ -42,7 +42,12 @@ export function formatCard(rec: AskRecord, now: Date = new Date()): string {
   if (rec.status === "stale") lines.push("  - past TTL (stale, kept because high-risk)");
 
   lines.push("");
-  lines.push("Reply:  A / B / C / override: <text> / skip");
+  lines.push("Reply (run in your shell):");
+  lines.push(`  attn decide ${ask.id} A`);
+  lines.push(`  attn decide ${ask.id} B`);
+  lines.push(`  attn decide ${ask.id} C`);
+  lines.push(`  attn override ${ask.id} "<your text>"`);
+  lines.push(`  attn skip ${ask.id}`);
   return lines.join("\n");
 }
 
