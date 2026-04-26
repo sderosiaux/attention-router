@@ -1,7 +1,7 @@
 {
   "name": "attention-router",
   "description": "Triage AI coding agents' questions. Each agent posts a structured 'ask'; the local router runs a 5-persona LLM council, auto-resolves what's safe, and surfaces only the highest-value decisions to you.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "author": {
     "name": "sderosiaux"
   },

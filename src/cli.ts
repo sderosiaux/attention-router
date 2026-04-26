@@ -90,6 +90,29 @@ async function main(): Promise<void> {
       console.log(JSON.stringify({ results }, null, 2));
       return;
     }
+    case "tray": {
+      // Spawn the SwiftUI floating-decision app from apps/attn-tray.
+      // Resolves the swift project relative to this CLI file (works for both
+      // dev clone AND the plugin install path).
+      const here = path.dirname(new URL(import.meta.url).pathname);
+      const swiftDir = path.resolve(here, "..", "apps", "attn-tray");
+      try {
+        await fs.access(path.join(swiftDir, "Package.swift"));
+      } catch {
+        return die(`attn-tray sources not found at ${swiftDir}\nReinstall the plugin or check your repo layout.`);
+      }
+      console.log(`[attn tray] launching SwiftUI app from ${swiftDir}`);
+      console.log(`[attn tray] first run compiles for ~30s; subsequent runs <2s`);
+      const swift = spawn("swift", ["run", "--package-path", swiftDir, "AttnTray"], {
+        stdio: "inherit",
+      });
+      swift.on("error", (e) => {
+        die(`failed to spawn swift: ${e.message}\nInstall Swift toolchain: xcode-select --install`);
+      });
+      // Keep this process alive until swift exits
+      await new Promise<void>((res) => swift.on("exit", () => res()));
+      return;
+    }
     case "watch": {
       const intervalSec = Number(args[0] ?? process.env.AR_WATCH_INTERVAL_SEC ?? 5);
       if (!Number.isFinite(intervalSec) || intervalSec < 1) return die("usage: watch [interval_sec]");
@@ -264,6 +287,7 @@ Commands:
   next                               show top decision card
   batch                              show top 3 cards
   watch [interval_sec]               poll daemon, fire macOS notification on each new pending card
+  tray                               launch the SwiftUI floating-decision UI (macOS, requires Swift)
   decide <ask_id> <A|B|C>            record human decision
   override <ask_id> "<text>"         record override
   skip <ask_id>                      defer (status=skipped)
