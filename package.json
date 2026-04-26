@@ -1,6 +1,6 @@
 {
   "name": "attention-router",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Local attention router for parallel coding agents",
   "type": "module",
   "bin": {

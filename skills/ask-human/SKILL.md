@@ -1,11 +1,29 @@
 ---
 name: ask-human
-description: Use when you reach a decision fork that you cannot resolve confidently from context alone — irreversible operations (migrations, force-pushes, deletions), architectural choices with several defensible answers, or ambiguous requirements where guessing wrong would cost real time. Sends a structured ask to the local attention-router via the `ask_human` MCP tool. The router LLM drafts 3 options from your dilemma + context, runs a 5-persona council, and either auto-resolves silently or queues for the human. Do NOT use for trivial choices, lookups answerable from documentation, or anything you can verify by reading more code or running a test.
+description: USE THIS INSTEAD OF asking the user a clarifying question inline. Triggers WHEN you are about to write "Q1 —", "Should I X or Y?", "Before I proceed, do you want…", "A. … B. … C. … which?", or any other inline question that blocks the task on a user choice. Also triggers when you reach an architectural fork (irreversible / costly / multiple defensible answers). Sends the dilemma to the local attention-router; the router LLM drafts 3 options, runs a 5-persona council, and either auto-resolves silently or queues for the human via macOS notif + AttnTray popup. The user clicks one button instead of typing a paragraph back to you. Do NOT use for trivial choices (variable names, formatting), lookups answerable from code/docs, or anything resolvable by reading one more file.
 ---
 
 # ask-human
 
-When you hit a decision fork:
+## 0. STOP — are you about to ask the user inline?
+
+If you are about to write any of these in your next response:
+
+- `Q1 — …?` / `Q2 — …?`
+- `Should I X or Y?`
+- `Before I proceed, do you want …`
+- `A. … B. … C. … which one?`
+- `Quick clarifications:` / `Some questions:`
+- `Let me know if you'd prefer …`
+
+**STOP.** This is exactly what `ask_human` is for. Do **NOT** write the question inline. Use the MCP tool below. The user has invested in installing the router specifically so they can answer with one click instead of reading a paragraph and typing.
+
+The only legitimate inline questions are:
+- Tiny clarifications resolvable in <5 words ("which file?", "the v2 endpoint?")
+- Status checks ("ready to push?")
+- Things the user must *type* (a name, a URL, free-form input that doesn't fit A/B/C)
+
+Everything else with 2-3 defensible options → `ask_human`.
 
 ## 1. Decide if you should ask
 
