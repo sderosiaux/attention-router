@@ -1,14 +1,19 @@
-// AttnTray — minimal SwiftUI floating UI for attention-router.
-// Polls the daemon every N seconds; when a new pending card escalates,
-// shows a modal-style floating window with big A/B/C/Override/Skip buttons.
-// Click → POST /decisions or /skip → window dismisses → back to polling.
+// AttnTray — macOS menubar app for attention-router.
+//
+// Two surfaces:
+//   1. Persistent icon in the top menubar (NSStatusItem). Badge shows
+//      pending count. Click → opens the decision window manually.
+//   2. A FLOATING window that auto-pops up above every other app the
+//      moment a NEW pending card is detected by the poller. This is the
+//      "push" surface the user actually needs.
+//
+// One process. No Dock icon (.accessory activation policy).
 
 import AppKit
 import Combine
-import Foundation
 import SwiftUI
 
-// MARK: - Daemon types (mirror server JSON shape, kept minimal)
+// MARK: - Daemon types
 
 struct AskOption: Decodable, Identifiable {
   let id: String
@@ -41,25 +46,20 @@ struct BidSummary: Decodable {
   let reason: String?
 }
 
-struct Record: Decodable {
+struct Record: Decodable, Identifiable {
   let ask: Ask
   let status: String
   let urgency: String?
   let council: CouncilSummary?
   let bid: BidSummary?
-  let decision: AnyCodable?
+  var id: String { ask.id }
 }
 
 struct NextResponse: Decodable {
   let batch: [Record]
 }
 
-// throwaway box for ignored fields
-struct AnyCodable: Decodable {
-  init(from decoder: Decoder) throws {}
-}
-
-// MARK: - Networking
+// MARK: - Daemon client
 
 enum DaemonError: Error { case http(Int, String) }
 
@@ -83,32 +83,28 @@ actor Daemon {
     return r
   }
 
-  func nextBatch() async throws -> NextResponse {
+  func nextBatch() async throws -> [Record] {
     let r = req("GET", "/next?max=3")
     let (data, resp) = try await URLSession.shared.data(for: r)
     guard let h = resp as? HTTPURLResponse, h.statusCode == 200 else {
-      throw DaemonError.http((resp as? HTTPURLResponse)?.statusCode ?? -1,
-                             String(data: data, encoding: .utf8) ?? "")
+      throw DaemonError.http((resp as? HTTPURLResponse)?.statusCode ?? -1, String(data: data, encoding: .utf8) ?? "")
     }
-    return try JSONDecoder().decode(NextResponse.self, from: data)
+    return try JSONDecoder().decode(NextResponse.self, from: data).batch
   }
 
   func decide(askId: String, choice: String, override: String? = nil) async throws {
     var body: [String: Any] = ["ask_id": askId, "choice": choice, "create_rule": true]
     if let o = override { body["override_text"] = o }
     let data = try JSONSerialization.data(withJSONObject: body)
-    let r = req("POST", "/decisions", body: data)
-    let (resp_data, resp) = try await URLSession.shared.data(for: r)
+    let (rd, resp) = try await URLSession.shared.data(for: req("POST", "/decisions", body: data))
     guard let h = resp as? HTTPURLResponse, (200..<300).contains(h.statusCode) else {
-      throw DaemonError.http((resp as? HTTPURLResponse)?.statusCode ?? -1,
-                             String(data: resp_data, encoding: .utf8) ?? "")
+      throw DaemonError.http((resp as? HTTPURLResponse)?.statusCode ?? -1, String(data: rd, encoding: .utf8) ?? "")
     }
   }
 
   func skip(askId: String) async throws {
     let data = try JSONSerialization.data(withJSONObject: ["id": askId])
-    let r = req("POST", "/skip", body: data)
-    _ = try await URLSession.shared.data(for: r)
+    _ = try await URLSession.shared.data(for: req("POST", "/skip", body: data))
   }
 }
 
@@ -116,11 +112,18 @@ actor Daemon {
 
 @MainActor
 final class Poller: ObservableObject {
-  @Published var current: Record? = nil
+  @Published var batch: [Record] = []
   @Published var statusText: String = "polling…"
-  private var seen = Set<String>()
+  @Published var lastError: String? = nil
   private let daemon = Daemon()
   private let intervalSec: TimeInterval
+  private var seenIds = Set<String>()
+  private var firstPoll = true
+
+  /// Fires when at least one ID appears that the poller hasn't seen before.
+  /// Skipped on the very first poll so existing pending cards don't pop the
+  /// window the moment AttnTray launches.
+  var onNewCard: (() -> Void)?
 
   init() {
     let raw = ProcessInfo.processInfo.environment["AR_TRAY_INTERVAL_SEC"] ?? "5"
@@ -129,96 +132,106 @@ final class Poller: ObservableObject {
   }
 
   func loop() async {
-    // Seed with whatever's pending right now so we don't pop the window for
-    // cards the human already saw before launching the tray.
-    if let r = try? await daemon.nextBatch() {
-      for rec in r.batch { seen.insert(rec.ask.id) }
-    }
     while true {
       do {
-        let resp = try await daemon.nextBatch()
-        for rec in resp.batch where !seen.contains(rec.ask.id) {
-          seen.insert(rec.ask.id)
-          if current == nil {
-            current = rec
-            NSApp.activate(ignoringOtherApps: true)
-          }
-          break
+        let recs = try await daemon.nextBatch()
+        let newIds = recs.map(\.ask.id).filter { !seenIds.contains($0) }
+        for id in newIds { seenIds.insert(id) }
+        batch = recs
+        statusText = recs.isEmpty ? "inbox zero" : "\(recs.count) pending"
+        lastError = nil
+        if !newIds.isEmpty && !firstPoll {
+          onNewCard?()
         }
-        statusText = "polling… (\(resp.batch.count) pending)"
+        firstPoll = false
       } catch {
-        statusText = "daemon unreachable"
+        lastError = "daemon unreachable"
+        statusText = "error"
       }
       try? await Task.sleep(nanoseconds: UInt64(intervalSec * 1_000_000_000))
     }
   }
 
-  func decide(_ choice: String) {
-    guard let rec = current else { return }
-    let askId = rec.ask.id
-    Task {
-      try? await daemon.decide(askId: askId, choice: choice)
-      await MainActor.run { self.current = nil }
-    }
+  func decide(_ choice: String) async {
+    guard let rec = batch.first else { return }
+    try? await daemon.decide(askId: rec.ask.id, choice: choice)
+    await refreshNow()
   }
 
-  func override(_ text: String) {
-    guard let rec = current, !text.isEmpty else { return }
-    let askId = rec.ask.id
-    Task {
-      try? await daemon.decide(askId: askId, choice: "override", override: text)
-      await MainActor.run { self.current = nil }
-    }
+  func override(_ text: String) async {
+    guard let rec = batch.first, !text.isEmpty else { return }
+    try? await daemon.decide(askId: rec.ask.id, choice: "override", override: text)
+    await refreshNow()
   }
 
-  func skip() {
-    guard let rec = current else { return }
-    let askId = rec.ask.id
-    Task {
-      try? await daemon.skip(askId: askId)
-      await MainActor.run { self.current = nil }
+  func skipCurrent() async {
+    guard let rec = batch.first else { return }
+    try? await daemon.skip(askId: rec.ask.id)
+    await refreshNow()
+  }
+
+  private func refreshNow() async {
+    if let recs = try? await daemon.nextBatch() {
+      batch = recs
+      statusText = recs.isEmpty ? "inbox zero" : "\(recs.count) pending"
     }
   }
 }
 
-// MARK: - UI
+// MARK: - Card view (shared between popover & floating window)
 
-struct CardView: View {
+struct CardContent: View {
   @ObservedObject var poller: Poller
   @State private var overrideText: String = ""
   @State private var showOverride: Bool = false
+  let onDismiss: () -> Void
 
   var body: some View {
-    if let rec = poller.current {
-      askView(rec)
+    if let rec = poller.batch.first {
+      cardView(rec)
     } else {
-      idleView
+      emptyView
     }
   }
 
-  private var idleView: some View {
-    VStack(spacing: 12) {
-      Text("attention-router").font(.title3.bold())
-      Text(poller.statusText).font(.callout).foregroundStyle(.secondary)
-      Text("Waiting for new pending cards…").font(.callout).foregroundStyle(.secondary)
-    }
-    .padding(40)
-    .frame(minWidth: 360, minHeight: 160)
-  }
-
-  private func askView(_ rec: Record) -> some View {
-    let council = rec.council?.predicted_human_choice
-    return VStack(alignment: .leading, spacing: 14) {
-      HStack {
-        Text(rec.ask.project_name).font(.caption).foregroundStyle(.secondary)
-        Spacer()
-        Text("[\(rec.ask.id)]").font(.system(.caption2, design: .monospaced)).foregroundStyle(.tertiary)
+  private var emptyView: some View {
+    VStack(spacing: 10) {
+      Image(systemName: "tray").font(.system(size: 40)).foregroundStyle(.secondary)
+      Text("Inbox zero").font(.headline)
+      Text(poller.statusText).font(.caption).foregroundStyle(.tertiary)
+      if let err = poller.lastError {
+        Text(err).font(.caption).foregroundStyle(.red)
       }
-      Text(rec.ask.title).font(.title2.bold()).fixedSize(horizontal: false, vertical: true)
+    }
+    .frame(width: 380, height: 200)
+    .padding(20)
+  }
+
+  private func cardView(_ rec: Record) -> some View {
+    let council = rec.council?.predicted_human_choice
+    return VStack(alignment: .leading, spacing: 12) {
+      HStack(spacing: 6) {
+        Text(rec.ask.project_name).font(.caption).foregroundStyle(.secondary)
+        Text("·").foregroundStyle(.tertiary)
+        Text(rec.urgency ?? "?").font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
+          .background(urgencyColor(rec.urgency).opacity(0.18))
+          .foregroundStyle(urgencyColor(rec.urgency))
+          .cornerRadius(3)
+        Spacer()
+        if poller.batch.count > 1 {
+          Text("+\(poller.batch.count - 1) more").font(.caption2).foregroundStyle(.tertiary)
+        }
+      }
+
+      Text(rec.ask.title)
+        .font(.headline)
+        .fixedSize(horizontal: false, vertical: true)
+
       ScrollView {
         Text(rec.ask.context).font(.callout).foregroundStyle(.secondary)
           .frame(maxWidth: .infinity, alignment: .leading)
-      }.frame(maxHeight: 100)
+      }
+      .frame(maxHeight: 90)
 
       Divider()
 
@@ -231,12 +244,13 @@ struct CardView: View {
       Divider()
 
       HStack {
-        Button("Skip (snooze)") { poller.skip() }
+        Button("Skip") { Task { await poller.skipCurrent(); onDismiss() } }
           .keyboardShortcut("s", modifiers: [.command])
         Spacer()
         Button(showOverride ? "Cancel override" : "Override…") { showOverride.toggle() }
           .keyboardShortcut("o", modifiers: [.command])
       }
+
       if showOverride {
         TextField("Tell the agent exactly what to do", text: $overrideText, axis: .vertical)
           .textFieldStyle(.roundedBorder)
@@ -244,7 +258,8 @@ struct CardView: View {
         HStack {
           Spacer()
           Button("Submit override") {
-            poller.override(overrideText)
+            let text = overrideText
+            Task { await poller.override(text); onDismiss() }
             overrideText = ""
             showOverride = false
           }
@@ -254,21 +269,21 @@ struct CardView: View {
         }
       }
 
-      if let bid = rec.bid?.reason {
-        Text("Why this reached you: \(bid)")
-          .font(.caption).foregroundStyle(.tertiary).italic()
+      if let bid = rec.bid?.reason, !bid.isEmpty {
+        Text(bid).font(.caption2).foregroundStyle(.tertiary).italic()
+          .lineLimit(2)
       }
     }
-    .padding(20)
-    .frame(width: 560)
+    .padding(16)
+    .frame(width: 480)
   }
 
   private func optionButton(opt: AskOption, isDefault: Bool, isCouncilPick: Bool) -> some View {
-    Button(action: { poller.decide(opt.id) }) {
-      VStack(alignment: .leading, spacing: 4) {
-        HStack {
-          Text(opt.id).font(.title.bold()).frame(width: 28)
-          Text(opt.label).font(.headline).fixedSize(horizontal: false, vertical: true)
+    Button(action: { Task { await poller.decide(opt.id); onDismiss() } }) {
+      VStack(alignment: .leading, spacing: 3) {
+        HStack(spacing: 6) {
+          Text(opt.id).font(.title2.bold()).frame(width: 22)
+          Text(opt.label).font(.subheadline.bold()).fixedSize(horizontal: false, vertical: true)
           Spacer()
           if isDefault { tag("default", .blue) }
           if isCouncilPick { tag("council", .purple) }
@@ -276,56 +291,162 @@ struct CardView: View {
         Text("→ \(opt.predicted_next_step)").font(.caption).foregroundStyle(.secondary)
         Text("⚠ \(opt.cost_if_wrong)").font(.caption).foregroundStyle(.secondary)
       }
-      .padding(10)
+      .padding(8)
       .frame(maxWidth: .infinity, alignment: .leading)
-      .background(RoundedRectangle(cornerRadius: 8).fill(Color(NSColor.controlBackgroundColor)))
+      .background(RoundedRectangle(cornerRadius: 6).fill(Color(NSColor.controlBackgroundColor)))
     }
     .buttonStyle(.plain)
     .keyboardShortcut(KeyEquivalent(Character(opt.id.lowercased())), modifiers: [])
   }
 
   private func tag(_ text: String, _ color: Color) -> some View {
-    Text(text).font(.caption2).padding(.horizontal, 6).padding(.vertical, 2)
-      .background(color.opacity(0.18)).foregroundStyle(color).cornerRadius(4)
+    Text(text).font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
+      .background(color.opacity(0.18)).foregroundStyle(color).cornerRadius(3)
+  }
+
+  private func urgencyColor(_ u: String?) -> Color {
+    switch u {
+    case "now": return .red
+    case "soon": return .orange
+    case "today": return .blue
+    default: return .gray
+    }
   }
 }
 
-// MARK: - App entry
+// MARK: - Floating window (push surface)
+
+@MainActor
+final class FloatingWindowController {
+  private var window: NSWindow?
+  private let poller: Poller
+
+  init(poller: Poller) {
+    self.poller = poller
+  }
+
+  func show() {
+    if window == nil { build() }
+    guard let w = window else { return }
+    centerOnActiveScreen(w)
+    NSApp.activate(ignoringOtherApps: true)
+    w.makeKeyAndOrderFront(nil)
+  }
+
+  func hide() {
+    window?.orderOut(nil)
+  }
+
+  private func build() {
+    let view = CardContent(poller: poller, onDismiss: { [weak self] in self?.hide() })
+    let host = NSHostingController(rootView: view)
+    let w = NSWindow(contentViewController: host)
+    w.styleMask = [.titled, .closable]
+    w.title = "attention-router"
+    w.titlebarAppearsTransparent = true
+    w.isMovableByWindowBackground = true
+    w.level = .floating // above regular windows
+    w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+    w.isReleasedWhenClosed = false
+    w.standardWindowButton(.miniaturizeButton)?.isHidden = true
+    w.standardWindowButton(.zoomButton)?.isHidden = true
+    self.window = w
+  }
+
+  private func centerOnActiveScreen(_ w: NSWindow) {
+    guard let screen = NSScreen.main else { w.center(); return }
+    let frame = screen.visibleFrame
+    let size = w.frame.size
+    let origin = NSPoint(
+      x: frame.midX - size.width / 2,
+      y: frame.midY - size.height / 2
+    )
+    w.setFrameOrigin(origin)
+  }
+}
+
+// MARK: - Status item icon (the dot in the menubar)
+
+@MainActor
+final class MenubarController {
+  let statusItem: NSStatusItem
+  let popover: NSPopover
+  let poller: Poller
+  let floating: FloatingWindowController
+  private var batchSubscription: AnyCancellable?
+
+  init(poller: Poller, floating: FloatingWindowController) {
+    self.poller = poller
+    self.floating = floating
+    self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    self.popover = NSPopover()
+    self.popover.contentSize = NSSize(width: 480, height: 520)
+    self.popover.behavior = .transient
+    self.popover.contentViewController = NSHostingController(
+      rootView: CardContent(poller: poller, onDismiss: { [weak self] in self?.popover.performClose(nil) })
+    )
+
+    if let button = statusItem.button {
+      button.image = NSImage(systemSymbolName: "tray.fill", accessibilityDescription: "attention-router")
+      button.imagePosition = .imageLeft
+      button.target = self
+      button.action = #selector(togglePopover(_:))
+    }
+
+    poller.onNewCard = { [weak self] in
+      Task { @MainActor in self?.floating.show() }
+    }
+
+    batchSubscription = poller.$batch.sink { [weak self] _ in
+      Task { @MainActor in self?.refreshBadge() }
+    }
+  }
+
+  @objc func togglePopover(_ sender: AnyObject?) {
+    if popover.isShown {
+      popover.performClose(sender)
+    } else if let button = statusItem.button {
+      popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+      popover.contentViewController?.view.window?.makeKey()
+    }
+  }
+
+  func refreshBadge() {
+    let n = poller.batch.count
+    if let button = statusItem.button {
+      if poller.lastError != nil {
+        button.title = " ⚠"
+      } else if n > 0 {
+        button.title = " \(n)"
+      } else {
+        button.title = ""
+      }
+    }
+  }
+}
+
+// MARK: - App entry (NSApplication.run, no SwiftUI App)
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+  var poller: Poller!
+  var menubar: MenubarController!
+  var floating: FloatingWindowController!
+
+  func applicationDidFinishLaunching(_ notification: Notification) {
+    NSApp.setActivationPolicy(.accessory) // no Dock icon
+    poller = Poller()
+    floating = FloatingWindowController(poller: poller)
+    menubar = MenubarController(poller: poller, floating: floating)
+  }
+}
 
 @main
-struct AttnTrayApp: App {
-  @StateObject private var poller = Poller()
-
-  init() {
-    NSApplication.shared.setActivationPolicy(.accessory) // no Dock icon
+struct AttnTrayMain {
+  @MainActor static func main() {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.run()
   }
-
-  var body: some Scene {
-    WindowGroup("attention-router") {
-      CardView(poller: poller)
-        .background(WindowAccessor { window in
-          window.level = .floating
-          window.isMovableByWindowBackground = true
-          window.titlebarAppearsTransparent = true
-          window.titleVisibility = .hidden
-          window.standardWindowButton(.miniaturizeButton)?.isHidden = true
-          window.standardWindowButton(.zoomButton)?.isHidden = true
-        })
-    }
-    .windowStyle(.hiddenTitleBar)
-    .windowResizability(.contentSize)
-  }
-}
-
-// SwiftUI escape hatch to grab the underlying NSWindow for chrome tweaks.
-struct WindowAccessor: NSViewRepresentable {
-  let callback: (NSWindow) -> Void
-  func makeNSView(context: Context) -> NSView {
-    let v = NSView()
-    DispatchQueue.main.async {
-      if let w = v.window { callback(w) }
-    }
-    return v
-  }
-  func updateNSView(_ nsView: NSView, context: Context) {}
 }
