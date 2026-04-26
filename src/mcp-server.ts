@@ -61,7 +61,7 @@ PREREQ: the attention-router daemon must be running on ${ROUTER_BASE}. The plugi
 // ──────────────────────────────────────────────────────────────────────
 server.tool(
   "ask_human",
-  "Submit a decision to the local attention-router. The router LLM drafts 3 options from your dilemma+context, runs a council, and either auto-resolves or queues for the human. You only need to provide the dilemma and context — the router builds the structured ask for you.",
+  "Submit a decision to the local attention-router AND BLOCK until you have an answer. The router LLM drafts 3 options from your dilemma+context, runs a council, and either auto-resolves silently (returns the safe default immediately) or queues for the human (the tool then polls internally and returns when the human decides). Default timeout 10min. Pass wait=false for fire-and-forget (legacy).",
   {
     dilemma: z
       .string()
@@ -108,6 +108,17 @@ server.tool(
       .positive()
       .optional()
       .describe("TTL on the ask. Defaults to 3600 (1h)."),
+    wait: z
+      .boolean()
+      .optional()
+      .describe("If true (default), block until the human decides. The tool polls the daemon internally so the agent doesn't have to remember to call wait_for_decision. Set to false for fire-and-forget; you'll then need to call wait_for_decision manually."),
+    wait_timeout_sec: z
+      .number()
+      .int()
+      .min(5)
+      .max(86400) // 24h ceiling
+      .optional()
+      .describe("Hard timeout for the internal wait when wait=true. Defaults to 14400 (4h) — humans take time. Max 86400 (24h). After timeout, returns the queued ask_id so you can call wait_for_decision again."),
   },
   async (input) => {
     const body = {
@@ -150,24 +161,96 @@ server.tool(
     }
 
     // queued
+    const askId: string = out.ask_id;
     const optionsSummary = (out.drafted_ask?.options ?? [])
       .map(
         (o: { id: string; label: string; predicted_next_step: string }) =>
           `  ${o.id}. ${o.label} → ${o.predicted_next_step}`,
       )
       .join("\n");
+    const queuedHeader =
+      `Title: ${out.drafted_ask?.title}\n` +
+      `Default: ${out.drafted_ask?.default_option_id}  Council pick: ${out.council?.predicted_human_choice}\n\n` +
+      `Options:\n${optionsSummary}\n\n` +
+      `Why this reached the human: ${out.bid?.reason}`;
 
+    // Default: block until the human responds. The agent should not have to
+    // remember to poll — that defeats the whole point of the router.
+    if (input.wait !== false) {
+      const timeoutSec = input.wait_timeout_sec ?? 14400; // 4h default
+      const decision = await pollForDecision(askId, timeoutSec);
+      if (decision.kind === "decided") {
+        return textContent(
+          `decided: ${decision.value}\n\nask_id=${askId}\n\n${queuedHeader}\n\nApply this choice and proceed.`,
+        );
+      }
+      if (decision.kind === "expired") {
+        return textContent(
+          `expired: ask_id=${askId} aged out before the human responded.\n\n${queuedHeader}\n\nProceed with the agent default (${out.drafted_ask?.default_option_id}) or re-submit with a tighter expires_in_seconds.`,
+        );
+      }
+      if (decision.kind === "skipped") {
+        return textContent(
+          `skipped: human deferred ask_id=${askId}.\n\n${queuedHeader}\n\nThe ask will re-surface after AR_SKIP_COOLDOWN_SEC. Proceed with the agent default for now or wait again.`,
+        );
+      }
+      if (decision.kind === "error") {
+        return errorContent(`error while polling: ${decision.message}`);
+      }
+      // timeout
+      return textContent(
+        `timeout: ${timeoutSec}s elapsed without a human decision.\n\nask_id=${askId}\n${queuedHeader}\n\nThe ask is still pending. Call wait_for_decision({ask_id: "${askId}"}) to keep waiting, or proceed with the agent default.`,
+      );
+    }
+
+    // wait=false → return the queued status immediately (legacy / explicit fire-and-forget)
     return textContent(
-      `queued: ask_id=${out.ask_id}\n\n` +
-        `Title: ${out.drafted_ask?.title}\n` +
-        `Default: ${out.drafted_ask?.default_option_id}  Council pick: ${out.council?.predicted_human_choice}\n\n` +
-        `Options:\n${optionsSummary}\n\n` +
-        `Why this reached the human: ${out.bid?.reason}\n\n` +
-        `Next: call wait_for_decision({ask_id: "${out.ask_id}"}) to block until the human answers, ` +
-        `or proceed on something else and check back. The human sees this card via \`ar next\` (or your watcher).`,
+      `queued (fire-and-forget): ask_id=${askId}\n\n${queuedHeader}\n\nNext: call wait_for_decision({ask_id: "${askId}"}) when you need the answer.`,
     );
   },
 );
+
+// ──────────────────────────────────────────────────────────────────────
+// Internal polling helper (used by ask_human's blocking path)
+// ──────────────────────────────────────────────────────────────────────
+type PollResult =
+  | { kind: "decided"; value: string }
+  | { kind: "expired" }
+  | { kind: "skipped" }
+  | { kind: "error"; message: string }
+  | { kind: "timeout" };
+
+async function pollForDecision(askId: string, maxWaitSec: number): Promise<PollResult> {
+  const intervalMs = 5000;
+  const deadline = Date.now() + maxWaitSec * 1000;
+  while (Date.now() < deadline) {
+    let rec: any;
+    try {
+      const r = await routerFetch(`/asks/${encodeURIComponent(askId)}`);
+      if (r.status === 404) return { kind: "error", message: `ask_id=${askId} not found` };
+      const out = (await r.json()) as any;
+      rec = out.record;
+    } catch (e) {
+      return { kind: "error", message: (e as Error).message };
+    }
+    if (!rec) return { kind: "error", message: "empty record" };
+
+    if (rec.decision) {
+      const value = rec.decision.choice === "override"
+        ? `override: ${rec.decision.override_text}`
+        : rec.decision.choice;
+      return { kind: "decided", value };
+    }
+    if (rec.status === "auto_resolved") {
+      return { kind: "decided", value: rec.safe_default_option_id ?? "A" };
+    }
+    if (rec.status === "expired") return { kind: "expired" };
+    if (rec.status === "skipped") return { kind: "skipped" };
+
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return { kind: "timeout" };
+}
 
 // ──────────────────────────────────────────────────────────────────────
 // Tool: wait_for_decision
@@ -188,13 +271,13 @@ server.tool(
       .number()
       .int()
       .min(5)
-      .max(900)
+      .max(86400)
       .optional()
-      .describe("Hard timeout. Defaults to 300 (5min). After timeout, call again to keep waiting."),
+      .describe("Hard timeout. Defaults to 14400 (4h). Max 86400 (24h). After timeout, call again to keep waiting."),
   },
   async ({ ask_id, poll_interval_sec, max_wait_sec }) => {
     const intervalMs = (poll_interval_sec ?? 5) * 1000;
-    const deadlineMs = Date.now() + (max_wait_sec ?? 300) * 1000;
+    const deadlineMs = Date.now() + (max_wait_sec ?? 14400) * 1000;
 
     while (Date.now() < deadlineMs) {
       let rec: {
@@ -249,7 +332,7 @@ server.tool(
     }
 
     return textContent(
-      `timeout after ${max_wait_sec ?? 300}s waiting for ask_id=${ask_id}. The ask is still pending; call wait_for_decision again to keep waiting, or proceed with the agent default if the work is unblocked.`,
+      `timeout after ${max_wait_sec ?? 14400}s waiting for ask_id=${ask_id}. The ask is still pending; call wait_for_decision again to keep waiting, or proceed with the agent default if the work is unblocked.`,
     );
   },
 );
