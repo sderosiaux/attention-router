@@ -1,0 +1,53 @@
+{
+  "id": "ask_demo_001",
+  "project_id": "checkout-api",
+  "project_name": "checkout-api",
+  "project_type": "software",
+  "verification_surface": "business_rule",
+  "title": "Pick rate-limit strategy for /checkout endpoint",
+  "context": "We just saw a burst of 5x normal traffic from one IP block. Need a guard before tomorrow's promo. Auth is per-user JWT. Redis already in stack.",
+  "options": [
+    {
+      "id": "A",
+      "label": "Token bucket per user_id (Redis)",
+      "evidence": [
+        "redis already in stack",
+        "per-user fairness preferred over per-IP for logged-in users",
+        "burst tolerated, sustained abuse blocked"
+      ],
+      "predicted_next_step": "add middleware checkout.ts with redis token bucket, default 30 req/min per user, burst 60",
+      "cost_if_wrong": "false-positive blocks of legit power users; reversible by raising limit",
+      "confidence": 0.75
+    },
+    {
+      "id": "B",
+      "label": "IP-based fixed window in nginx",
+      "evidence": [
+        "no app code changes",
+        "fast to deploy",
+        "but shared NAT users get punished"
+      ],
+      "predicted_next_step": "edit nginx.conf with limit_req_zone $binary_remote_addr",
+      "cost_if_wrong": "punishes corporate NAT users; reload nginx to revert",
+      "confidence": 0.55
+    },
+    {
+      "id": "C",
+      "label": "Do nothing, watch dashboards",
+      "evidence": [
+        "current load survived prior promos",
+        "rate limit could cause more incidents than abuse"
+      ],
+      "predicted_next_step": "add alert at 10x normal, manual triage",
+      "cost_if_wrong": "DB outage if abuse continues; pager event",
+      "confidence": 0.4
+    }
+  ],
+  "default_option_id": "A",
+  "confidence": 0.6,
+  "reversibility": "git_revert",
+  "expected_loss_if_wrong": 250,
+  "requested_human_seconds": 30,
+  "expires_in_seconds": 1800,
+  "created_at": "2026-04-26T10:00:00.000Z"
+}

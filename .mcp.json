@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "attention-router": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/ar-mcp.mjs"],
+      "env": {
+        "AR_HOST": "127.0.0.1",
+        "AR_PORT": "7777"
+      }
+    }
+  }
+}

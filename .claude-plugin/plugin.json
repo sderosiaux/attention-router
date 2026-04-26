@@ -1,0 +1,21 @@
+{
+  "name": "attention-router",
+  "description": "Triage AI coding agents' questions. Each agent posts a structured 'ask'; the local router runs a 5-persona LLM council, auto-resolves what's safe, and surfaces only the highest-value decisions to you.",
+  "version": "0.1.0",
+  "author": {
+    "name": "sderosiaux"
+  },
+  "homepage": "https://github.com/sderosiaux/attention-router",
+  "repository": "https://github.com/sderosiaux/attention-router",
+  "license": "MIT",
+  "keywords": [
+    "agent",
+    "decision",
+    "council",
+    "router",
+    "llm",
+    "triage",
+    "attention",
+    "no-naked-questions"
+  ]
+}

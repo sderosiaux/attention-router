@@ -1,0 +1,21 @@
+{
+  "id": "ask_naked_001",
+  "project_id": "checkout-api",
+  "project_name": "checkout-api",
+  "project_type": "software",
+  "verification_surface": "text",
+  "title": "what should I do?",
+  "context": "rate limiting feels off",
+  "options": [
+    { "id": "A", "label": "thing", "evidence": ["maybe"], "predicted_next_step": "tbd", "cost_if_wrong": "unclear", "confidence": 0.3 },
+    { "id": "B", "label": "other", "evidence": ["maybe"], "predicted_next_step": "tbd", "cost_if_wrong": "unclear", "confidence": 0.3 },
+    { "id": "C", "label": "third", "evidence": ["maybe"], "predicted_next_step": "tbd", "cost_if_wrong": "unclear", "confidence": 0.3 }
+  ],
+  "default_option_id": "A",
+  "confidence": 0.3,
+  "reversibility": "git_revert",
+  "expected_loss_if_wrong": 10,
+  "requested_human_seconds": 60,
+  "expires_in_seconds": 3600,
+  "created_at": "2026-04-26T10:00:00.000Z"
+}
