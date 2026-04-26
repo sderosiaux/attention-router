@@ -43,11 +43,11 @@ The plugin ships:
 | File | Purpose |
 |---|---|
 | `.claude-plugin/plugin.json` | Plugin metadata |
-| `.mcp.json` | Declares the `attention-router` MCP server (stdio transport, `node bin/ar-mcp.mjs`) |
+| `.mcp.json` | Declares the `attention-router` MCP server (stdio transport, `node bin/attn-mcp.mjs`) |
 | `skills/ask-human/SKILL.md` | Tells Claude WHEN to invoke the `ask_human` MCP tool |
 | `hooks/hooks.json` + `scripts/ensure-daemon.sh` | SessionStart hook: lazy-launches the HTTP daemon on `127.0.0.1:7777` if not already running |
-| `bin/ar-mcp.mjs` | MCP server entry point (wraps `src/mcp-server.ts` via tsx) |
-| `bin/ar.mjs` | CLI for the human side (`next`, `decide`, `status`, …) |
+| `bin/attn-mcp.mjs` | MCP server entry point (wraps `src/mcp-server.ts` via tsx) |
+| `bin/attn.mjs` | CLI for the human side (`next`, `decide`, `status`, …) |
 
 ## Prerequisites
 
@@ -60,17 +60,24 @@ The plugin ships:
 The plugin doesn't pop a UI. You watch the queue in one terminal:
 
 ```sh
-watch -n 5 'cd ~/code/personal/attention-router && npx tsx src/cli.ts batch'
+watch -n 5 attn batch
+```
+
+If `attn` is not on your PATH (the plugin install doesn't auto-link it), add an alias once:
+
+```sh
+echo 'alias attn="npx -y tsx ~/.claude/plugins/attention-router/src/cli.ts"' >> ~/.zshrc
+# or `npm install -g .` from a clone of the repo
 ```
 
 Or one-shot:
 
 ```sh
-ar next                          # top card
-ar decide ask_xxx A              # take option A
-ar override ask_xxx "use mTLS"   # override with text
-ar skip ask_xxx                  # defer (re-surfaces after cooldown)
-ar status                        # global counters
+attn next                          # top card
+attn decide ask_xxx A              # take option A
+attn override ask_xxx "use mTLS"   # override with text
+attn skip ask_xxx                  # defer (re-surfaces after cooldown)
+attn status                        # global counters
 ```
 
 ## How a Claude Code agent sees the tools

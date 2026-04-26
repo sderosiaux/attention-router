@@ -44,7 +44,7 @@ agent ── POST /asks/structure ──┐
                      │ _resolved   for human│
                      └────┬─────────────┬───┘
                           │             │
-              proceeds ◀──┘             └──▶  ar next  →  YOU
+              proceeds ◀──┘             └──▶  attn next  →  YOU
               silently                        (1-3 cards, ranked)
 ```
 
@@ -93,7 +93,7 @@ That's it. The plugin ships:
 | **MCP server** (stdio) | Exposes `ask_human`, `wait_for_decision`, `get_pending` tools to Claude |
 | **`ask-human` skill** | Teaches Claude *when* to invoke `ask_human` (vs. resolving the fork itself) |
 | **SessionStart hook** | Idempotently launches the daemon on `127.0.0.1:7777` if not already up |
-| **CLI** (`ar`) | Your side: `ar next`, `ar batch`, `ar decide`, `ar status` |
+| **CLI** (`attn`) | Your side: `attn next`, `attn batch`, `attn decide`, `attn status` |
 
 ### Requirements
 
@@ -106,13 +106,13 @@ That's it. The plugin ships:
 2. Agents that hit a real fork **invoke `ask_human` themselves** (the skill triggers them). You see nothing in that terminal.
 3. In **one** dedicated watcher terminal:
    ```sh
-   watch -n 5 ar batch
+   watch -n 5 attn batch
    ```
 4. When a card surfaces, decide in seconds:
    ```sh
-   ar decide ask_xxx A
-   ar override ask_xxx "use mTLS, skip JWT"
-   ar skip ask_xxx              # snooze for AR_SKIP_COOLDOWN_SEC
+   attn decide ask_xxx A
+   attn override ask_xxx "use mTLS, skip JWT"
+   attn skip ask_xxx              # snooze for AR_SKIP_COOLDOWN_SEC
    ```
 
 > **Don't try to invoke MCP tools by hand or curl the daemon manually.** Claude does it. Your job is to install the plugin and watch the queue. Manual HTTP usage is documented under [Other agents](#other-agents-raw-http) for non-Claude-Code integrations only.
@@ -142,30 +142,37 @@ Full spec: [`specs/attention-router.md`](specs/attention-router.md).
 
 ## The human side
 
-The CLI is the only thing you regularly touch.
+The CLI is the only thing you regularly touch. **Note**: `/plugin install` does not auto-link the `attn` binary to your `PATH`. Add an alias once:
+
+```sh
+echo 'alias attn="npx -y tsx ~/.claude/plugins/attention-router/src/cli.ts"' >> ~/.zshrc
+exec zsh
+```
+
+(or `git clone … && cd attention-router && npm install -g .` if you prefer a global install).
 
 ```
-ar next                            top decision card (most important right now)
-ar batch                           top 1–3 cards
-ar decide <ask_id> <A|B|C>         record decision (drafts a rule)
-ar override <ask_id> "<text>"      free-form override (drafts a rule)
-ar skip <ask_id>                   defer (re-surfaces after AR_SKIP_COOLDOWN_SEC)
-ar status                          counters (pending / decided / auto-resolved / …)
-ar projects                        per-project pending counts
+attn next                            top decision card (most important right now)
+attn batch                           top 1–3 cards
+attn decide <ask_id> <A|B|C>         record decision (drafts a rule)
+attn override <ask_id> "<text>"      free-form override (drafts a rule)
+attn skip <ask_id>                   defer (re-surfaces after AR_SKIP_COOLDOWN_SEC)
+attn status                          counters (pending / decided / auto-resolved / …)
+attn projects                        per-project pending counts
 
-ar rules                           list rules incl. drafts
-ar accept-rule <id>                draft → accepted (weighs future councils)
-ar reject-rule <id>                kill a rule
-ar edit-rule <id> <field> <value>  field ∈ prefer | avoid | priority | when
+attn rules                           list rules incl. drafts
+attn accept-rule <id>                draft → accepted (weighs future councils)
+attn reject-rule <id>                kill a rule
+attn edit-rule <id> <field> <value>  field ∈ prefer | avoid | priority | when
 ```
 
 Server lifecycle (you rarely run these — the plugin's hook handles it):
 
 ```
-ar start-server                    daemon on 127.0.0.1:7777
-ar submit-ask <file.json>          submit a single pre-built AgentAsk
-ar submit-jsonl <file>             one ask per line
-ar smart-ask <file.json>           {dilemma, context, project_id} → router LLM drafts the ask
+attn start-server                    daemon on 127.0.0.1:7777
+attn submit-ask <file.json>          submit a single pre-built AgentAsk
+attn submit-jsonl <file>             one ask per line
+attn smart-ask <file.json>           {dilemma, context, project_id} → router LLM drafts the ask
 ```
 
 ## Other agents (raw HTTP)
@@ -316,7 +323,7 @@ src/
   storage.ts        single-file JSON store + cross-process lock
   service.ts        orchestration (ask → council → bid → store)
   server.ts         HTTP daemon (auth, body cap, content-type guard)
-  cli.ts            ar … commands
+  cli.ts            attn … commands
   mcp-server.ts     MCP server (stdio) for Claude Code plugin
   rules.ts          JudgmentRule drafting + topic extraction
 .claude-plugin/     plugin manifest
