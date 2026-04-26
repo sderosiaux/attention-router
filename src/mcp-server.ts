@@ -111,14 +111,14 @@ server.tool(
     wait: z
       .boolean()
       .optional()
-      .describe("If true (default), block until the human decides. The tool polls the daemon internally so the agent doesn't have to remember to call wait_for_decision. Set to false for fire-and-forget; you'll then need to call wait_for_decision manually."),
+      .describe("If true (default), do a SHORT internal poll (default 30s) for fast cases — auto_resolved or fast human. If still pending after that, the tool returns 'queued' and the plugin's Stop hook (asyncRewake) will wake you when the human decides. Set wait=false to skip the short poll entirely (pure fire-and-forget)."),
     wait_timeout_sec: z
       .number()
       .int()
       .min(5)
-      .max(86400) // 24h ceiling
+      .max(86400)
       .optional()
-      .describe("Hard timeout for the internal wait when wait=true. Defaults to 14400 (4h) — humans take time. Max 86400 (24h). After timeout, returns the queued ask_id so you can call wait_for_decision again."),
+      .describe("How long the short internal poll runs (default 30s). Tune up if you want to block longer in-tool. The asyncRewake hook handles arbitrarily-long waits without blocking the tool call."),
   },
   async (input) => {
     const body = {
@@ -177,7 +177,7 @@ server.tool(
     // Default: block until the human responds. The agent should not have to
     // remember to poll — that defeats the whole point of the router.
     if (input.wait !== false) {
-      const timeoutSec = input.wait_timeout_sec ?? 14400; // 4h default
+      const timeoutSec = input.wait_timeout_sec ?? 30; // short default; Stop hook handles long waits
       const decision = await pollForDecision(askId, timeoutSec);
       if (decision.kind === "decided") {
         return textContent(
@@ -197,9 +197,9 @@ server.tool(
       if (decision.kind === "error") {
         return errorContent(`error while polling: ${decision.message}`);
       }
-      // timeout
+      // timeout — but the Stop hook (asyncRewake) will wake the agent when the human decides
       return textContent(
-        `timeout: ${timeoutSec}s elapsed without a human decision.\n\nask_id=${askId}\n${queuedHeader}\n\nThe ask is still pending. Call wait_for_decision({ask_id: "${askId}"}) to keep waiting, or proceed with the agent default.`,
+        `queued — short poll (${timeoutSec}s) timed out without a decision yet.\n\nask_id=${askId}\n${queuedHeader}\n\nNO ACTION NEEDED FROM YOU NOW. Continue the rest of your task. When you finish your turn, the Stop hook will wait in the background; once the human decides, you will be woken with the resolution as a system-reminder. If the work is unblocked, proceed with the agent default (${out.drafted_ask?.default_option_id}).`,
       );
     }
 

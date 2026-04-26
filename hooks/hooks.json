@@ -11,6 +11,20 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/await-decisions.sh",
+            "asyncRewake": true,
+            "rewakeMessage": "[attention-router] One or more pending asks were resolved while you were idle. Apply the choices below and continue the task.",
+            "rewakeSummary": "attention-router: pending ask resolved"
+          }
+        ]
+      }
     ]
   }
 }

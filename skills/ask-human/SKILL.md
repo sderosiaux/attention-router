@@ -50,7 +50,9 @@ The router's LLM drafts 3 distinct options from your dilemma + context — you d
 
 ## 4. Handle the response
 
-`ask_human` **blocks by default** — it polls the daemon internally and only returns when the human has decided (or auto-resolution / expiry / skip / timeout). You don't need a separate `wait_for_decision` call.
+`ask_human` does a **short poll (~30s)** then returns:
+- If the council auto-resolves OR the human responds in those 30s → tool returns the decision and you proceed.
+- If still pending after 30s → tool returns `queued`. **You don't need to wait inside the tool.** Continue the rest of your task. When you finish your turn, the plugin's Stop hook (`asyncRewake`) waits in the background for the human's decision and wakes you with the resolution as a system-reminder — even hours later. No manual `wait_for_decision` call needed in the typical path.
 
 Three possible outcomes:
 
